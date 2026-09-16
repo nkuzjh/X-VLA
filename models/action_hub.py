@@ -335,8 +335,14 @@ class AutoActionSpace(BaseActionSpace):
 
     def preprocess(self, proprio: torch.Tensor, action: torch.Tensor, mode: str = "train"):
         """
-        Pad action from real_dim to max_dim for the model.
+        Keep only real dimensions and pad them to the pretrained model width.
+
+        Denoising starts from a model-width [B,T,max_dim] noise tensor, while
+        supervised targets arrive as [B,T,real_dim]. Trimming before padding
+        makes both paths use zero-valued dummy dimensions and keeps training
+        and generation inputs identical.
         """
+        action = action[..., : self.real_dim]
         return proprio, self._pad_to_model_dim(action)
 
     def postprocess(self, action: torch.Tensor) -> torch.Tensor:

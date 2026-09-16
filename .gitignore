@@ -217,3 +217,7 @@ runnings/*
 logs/
 metas/
 demo.ipynb
+
+# Local CSGO integration artifacts
+/pretrained/
+/outputs/

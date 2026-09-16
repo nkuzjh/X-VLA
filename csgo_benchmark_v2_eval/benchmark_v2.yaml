@@ -1,0 +1,46 @@
+schema_version: 1
+benchmark_id: csgo_benchmark_v2
+maps:
+  - cs_agency
+  - cs_italy
+  - de_ancient
+  - de_anubis
+  - de_dust2
+  - de_inferno
+  - de_mirage
+  - de_nuke
+  - de_overpass
+  - de_train
+
+splits:
+  localization: seen_discrete_test
+  discrete: seen_discrete_test
+  continuous: seen_continuous
+
+localization:
+  prediction_pose_space: normalized
+  normalized_pose_order: [x, y, z, pitch, yaw]
+  xy_divisor: 1024.0
+  z_source: published_per_map_calibration
+  angle_divisor_degrees: 360.0
+  yaw_period_degrees: 360.0
+
+images:
+  paired_size: 448
+  interpolation: bicubic
+  discrete_batch_size: 8
+  continuous_batch_size: 1
+  dataloader_workers: 4
+  boundary_edge_quantile: 0.85
+  boundary_tolerance_pixels: 2
+
+continuous:
+  clip_length: 16
+  clip_stride: 16
+  fvd_size: 224
+  frame_diff_threshold: 2
+  min_track_len: 4
+  fvd_batch_size_divisor: 4
+  expected_clips_per_map: 20
+  expected_frames_per_clip: 64
+  fvd_cache_dir: ../../UniLIP/loaded_models

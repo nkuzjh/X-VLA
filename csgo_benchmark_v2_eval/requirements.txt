@@ -1,0 +1,10 @@
+# Use a compatible pre-existing PyTorch/torchvision environment. These two
+# packages are deliberately omitted so pip cannot replace a model environment.
+numpy==1.26.4
+Pillow==10.4.0
+torchmetrics==1.8.2
+torch-fidelity==0.4.0
+scipy==1.17.0
+opencv-python-headless==4.11.0.86
+PyYAML==6.0.3
+requests==2.32.3
