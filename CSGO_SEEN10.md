@@ -1,6 +1,6 @@
 # CSGO Benchmark v2 Seen-10 / X-VLA
 
-仅接入 localization；本次按 `RUN_FULL=0` 只执行真实 smoke。数据根目录只读：`/home/jiahao/task/UniLIP/data/csgo_benchmark_v2`。
+仅接入 localization；本次按 `RUN_FULL=0` 只执行真实 smoke。数据根目录只读：`/home/jiahao/task/UniLIP/data/csgo_benchmark_v2`。共享评测器目录为 `/home/jiahao/task/csgo_benchmark_v2_eval_general/`。
 
 ## 环境与数据验收
 
@@ -51,22 +51,23 @@ bash scripts/run_csgo_seen10.sh eval --seed 0
 cd /home/jiahao/task/X-VLA
 PYTHON="$PWD/.venv/bin/python"
 UNILIP_PYTHON=/home/jiahao/miniconda3/envs/UniLIP/bin/python
+SHARED_EVAL_DIR=/home/jiahao/task/csgo_benchmark_v2_eval_general
 DATA_ROOT=/home/jiahao/task/UniLIP/data/csgo_benchmark_v2
 OUTPUT_ROOT="$PWD/outputs/csgo_benchmark_v2_seen10/X-VLA/seed_0"
 
-"$PYTHON" train_seen10.py --config configs/csgo_seen10.json --seed 0 \
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" train_seen10.py --config configs/csgo_seen10.json --seed 0 \
   --data-root "$DATA_ROOT" --pretrained pretrained/X-VLA-Pt \
   --output-root "$OUTPUT_ROOT"
-"$PYTHON" infer_seen10.py --config configs/csgo_seen10.json --seed 0 \
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" infer_seen10.py --config configs/csgo_seen10.json --seed 0 \
   --data-root "$DATA_ROOT" --output-root "$OUTPUT_ROOT" \
   --checkpoint "$OUTPUT_ROOT/checkpoints/best"
-# 确保 predictions.jsonl 覆盖完整 20,000 条后再评正式指标。
-"$UNILIP_PYTHON" csgo_benchmark_v2_eval/run_eval.py localization \
+# 共享评测器会严格校验完整 20,000 条身份、重复和有限性后再写正式指标。
+PYTHONDONTWRITEBYTECODE=1 "$UNILIP_PYTHON" "$SHARED_EVAL_DIR/run_eval.py" localization \
   --pred-root "$OUTPUT_ROOT/localization" --data-root "$DATA_ROOT" \
   --output "$OUTPUT_ROOT/metrics/localization"
 ```
 
-续训时可将 `train_seen10.py` 的 `--resume` 指向同一 `OUTPUT_ROOT/checkpoints/last` 或具体的 `step_<step>`；`infer` 默认使用 `checkpoints/best`。`last.json` 和 `best.json` 记录实际指向的不可变 step 目录。正式输出根目录为 `outputs/csgo_benchmark_v2_seen10/X-VLA/seed_<seed>/`；预测为 `localization/predictions.jsonl`，指标为 `metrics/localization/`。`scripts/run_csgo_seen10.sh eval` 会先检查 20,000 条预测完整性；直接调用 evaluator 前也必须确认 coverage。
+续训时可将 `train_seen10.py` 的 `--resume` 指向同一 `OUTPUT_ROOT/checkpoints/last` 或具体的 `step_<step>`；`infer` 默认使用 `checkpoints/best`。`last.json` 和 `best.json` 记录实际指向的不可变 step 目录。正式输出根目录为 `outputs/csgo_benchmark_v2_seen10/X-VLA/seed_<seed>/`；预测为 `localization/predictions.jsonl`，指标为 `metrics/localization/`。`scripts/run_csgo_seen10.sh eval` 与直接调用共享 evaluator 都会严格检查完整 20,000 条预测的身份、重复和有限性。
 
 正式训练使用 50,000 条 seen_train，并仅依据 5,000 条 seen_validation 的自由生成验证误差选 checkpoint。50,000 step 默认每 10,000 step 验证并保存一次，共约 5 次；保留最近 5 个周期 checkpoint，并额外保护更老的 best，`last` 始终指向最近一次保存。动作是 horizon=1 的 `[x,y,z,pitch,yaw]`；前视图和 radar 使用原生 224×224 processor，proprio 恒零。smoke 使用独立目录，严禁将其数值填入正式结果表。
 
@@ -74,4 +75,4 @@ OUTPUT_ROOT="$PWD/outputs/csgo_benchmark_v2_seen10/X-VLA/seed_0"
 
 后续追加独立实验只需将 wrapper 命令中的 `--seed 0` 改为 `--seed 1` 或 `--seed 2`；输出会写入对应的独立 seed 目录。
 
-同步 evaluator 位于 `csgo_benchmark_v2_eval/`，评测使用 `/home/jiahao/miniconda3/envs/UniLIP/bin/python`。正式模型训练、全量推理和正式评测尚未执行。
+共享 evaluator 位于 `/home/jiahao/task/csgo_benchmark_v2_eval_general/`，评测使用 `/home/jiahao/miniconda3/envs/UniLIP/bin/python`。正式模型训练、全量推理和正式评测尚未执行。

@@ -6,12 +6,14 @@ cd "$PROJECT_ROOT"
 PYTHON="${CSGO_PYTHON:-$PROJECT_ROOT/.venv/bin/python}"
 DATA_ROOT="${DATA_ROOT:-/home/jiahao/task/UniLIP/data/csgo_benchmark_v2}"
 UNILIP_PYTHON="${UNILIP_PYTHON:-/home/jiahao/miniconda3/envs/UniLIP/bin/python}"
-SHARED_EVAL_DIR="${SHARED_EVAL_DIR:-$PROJECT_ROOT/csgo_benchmark_v2_eval}"
+SHARED_EVAL_DIR="${SHARED_EVAL_DIR:-$PROJECT_ROOT/../csgo_benchmark_v2_eval_general}"
+EVALUATOR="$SHARED_EVAL_DIR/run_eval.py"
 CONFIG="$PROJECT_ROOT/configs/csgo_seen10.json"
 PRETRAINED="$PROJECT_ROOT/pretrained/X-VLA-Pt"
 SEED=0
 OUTPUT_ROOT=""
 EXTRA_ARGS=()
+export PYTHONDONTWRITEBYTECODE=1
 
 usage() {
     cat <<'EOF'
@@ -50,10 +52,32 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 if ! [[ "$SEED" =~ ^[0-9]+$ ]]; then echo "--seed must be a nonnegative integer" >&2; exit 2; fi
-if [[ ! -x "$PYTHON" ]]; then
-    echo "Project Python is missing: $PYTHON. Run scripts/setup_csgo_seen10.sh first." >&2
-    exit 2
-fi
+check_model_python() {
+    if [[ ! -x "$PYTHON" ]]; then
+        echo "Project Python is missing: $PYTHON. Run scripts/setup_csgo_seen10.sh first." >&2
+        return 1
+    fi
+}
+
+check_evaluator() {
+    if [[ ! -f "$EVALUATOR" ]]; then
+        echo "Shared CSGO evaluator is missing: $EVALUATOR" >&2
+        echo "Set SHARED_EVAL_DIR to a directory containing run_eval.py." >&2
+        return 1
+    fi
+    if [[ ! -x "$UNILIP_PYTHON" ]]; then
+        echo "UniLIP evaluator Python is missing: $UNILIP_PYTHON" >&2
+        return 1
+    fi
+}
+
+case "$COMMAND" in
+    train|infer) check_model_python || exit 2 ;;
+    eval|smoke)
+        check_evaluator || exit 2
+        if [[ "$COMMAND" == smoke ]]; then check_model_python || exit 2; fi
+        ;;
+esac
 
 FORMAL_ROOT="$PROJECT_ROOT/outputs/csgo_benchmark_v2_seen10/X-VLA/seed_$SEED"
 if [[ -z "$OUTPUT_ROOT" ]]; then
@@ -67,14 +91,7 @@ COMMON=(--config "$CONFIG" --seed "$SEED" --data-root "$DATA_ROOT" --output-root
 
 evaluate() {
     local smoke_mode="$1"
-    local evaluator="$SHARED_EVAL_DIR/run_eval.py"
     local metrics_dir="$OUTPUT_ROOT/metrics/localization"
-    if [[ ! -f "$evaluator" ]]; then
-        echo "Missing shared evaluator: $evaluator" >&2
-        echo "BUILD_SHARED_EVALUATOR=0: sync the existing evaluator or set SHARED_EVAL_DIR. Prediction path: $OUTPUT_ROOT/localization/predictions.jsonl" >&2
-        return 2
-    fi
-    if [[ ! -x "$UNILIP_PYTHON" ]]; then echo "Metric Python is missing: $UNILIP_PYTHON" >&2; return 2; fi
     if [[ -e "$metrics_dir" ]]; then echo "Refusing to overwrite existing metrics: $metrics_dir" >&2; return 2; fi
     if [[ "$smoke_mode" == 1 ]]; then
         local smoke_metrics="$OUTPUT_ROOT/metrics/localization_smoke.json"
@@ -84,7 +101,7 @@ evaluate() {
         smoke_tmp="$(mktemp "$OUTPUT_ROOT/metrics/.localization_smoke.XXXXXX")"
         # The shared evaluator reads a global GT prefix. The model smoke emits
         # one prediction per map, so its first row is the matching prefix of 1.
-        if ! "$UNILIP_PYTHON" "$evaluator" smoke localization \
+        if ! "$UNILIP_PYTHON" "$EVALUATOR" smoke localization \
             --pred-root "$OUTPUT_ROOT/localization" --data-root "$DATA_ROOT" \
             --limit 1 > "$smoke_tmp"; then
             rm -f "$smoke_tmp"
@@ -95,36 +112,12 @@ evaluate() {
         echo "Nonformal localization smoke metrics (smoke_only=true): $smoke_metrics"
         return 0
     else
-        "$PYTHON" - "$DATA_ROOT" "$OUTPUT_ROOT" <<'PY'
-import json
-import math
-import sys
-from pathlib import Path
-from csgo_seen10.dataset import Seen10Dataset
-
-data_root, output_root = sys.argv[1], Path(sys.argv[2])
-if (output_root / "NON_FORMAL_SMOKE.json").exists():
-    raise SystemExit("A smoke output directory cannot be evaluated as a formal result")
-dataset = Seen10Dataset(data_root, "seen_discrete_test", include_targets=False)
-expected = {(row["map_name"], row["sample_id"]) for row in dataset.records}
-seen = set()
-with (output_root / "localization" / "predictions.jsonl").open() as stream:
-    for line_number, line in enumerate(stream, 1):
-        if not line.strip():
-            continue
-        row = json.loads(line)
-        identity = (row["map_name"], str(row["sample_id"]))
-        if identity not in expected or identity in seen:
-            raise SystemExit(f"Unexpected or duplicate identity at prediction line {line_number}: {identity}")
-        if not all(math.isfinite(float(row[f"pred_{axis}"])) for axis in ("x", "y", "z", "pitch", "yaw")):
-            raise SystemExit(f"Nonfinite prediction at line {line_number}")
-        seen.add(identity)
-if seen != expected:
-    raise SystemExit(f"Formal evaluation requires all 20000 identities; missing {len(expected - seen)}. Run infer to fill missing predictions.")
-print(f"Formal prediction coverage verified: {len(seen)}/20000")
-PY
+        if [[ -e "$OUTPUT_ROOT/NON_FORMAL_SMOKE.json" ]]; then
+            echo "A smoke output directory cannot be evaluated as a formal result: $OUTPUT_ROOT" >&2
+            return 2
+        fi
     fi
-    "$UNILIP_PYTHON" "$evaluator" localization \
+    "$UNILIP_PYTHON" "$EVALUATOR" localization \
         --pred-root "$OUTPUT_ROOT/localization" --data-root "$DATA_ROOT" \
         --output "$metrics_dir"
 }
