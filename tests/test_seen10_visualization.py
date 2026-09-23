@@ -1,13 +1,16 @@
 import json
+import io
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image
 import torch
 
 from csgo_seen10.dataset import SEEN_MAPS
+from infer_seen10 import _expected_metadata, _validate_checkpoint_action_contract, _write_prediction
 from csgo_seen10.visualization import (
     map_pixel_from_normalized,
     render_map_visualizations,
@@ -17,6 +20,137 @@ from train_seen10 import evaluate_validation
 
 
 class VisualizationTest(unittest.TestCase):
+    def test_checkpoint_without_action_metadata_is_inferred_as_legacy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            contract = _validate_checkpoint_action_contract(Path(temporary), {})
+        self.assertEqual(contract["mode"], "legacy_reset_dummy")
+        self.assertEqual(contract["source"], "legacy-inferred")
+
+    def test_standalone_official_action_contract_is_strictly_checked(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary)
+            contract = {
+                "mode": "official_auto",
+                "external_action_dim": 5,
+                "model_action_dim": 20,
+                "num_actions": 1,
+                "use_proprio": False,
+                "padding": "pad_before_noise",
+                "noise_width": 20,
+                "prediction_width": 20,
+                "loss": "valid_action_mse",
+                "loss_dimensions": 5,
+                "loss_scale": 100.0,
+                "dummy_channels_in_loss": False,
+                "inference_reset": False,
+                "target_pad_before_noise": True,
+                "final_output_dim": 5,
+                "objective": "x0_clean_action_denoising_regression",
+                "inference_steps": 10,
+            }
+            (checkpoint / "action_contract.json").write_text(json.dumps(contract), encoding="utf-8")
+            progress = {
+                "normalization": {"epsilon": None, "clamp": False, "qnorm": False},
+                "state": {"use_proprio": False, "dim": 20, "values": "all zeros"},
+            }
+            observed = _validate_checkpoint_action_contract(checkpoint, progress)
+            self.assertEqual(observed["mode"], "official_auto")
+
+            contract["noise_width"] = 5
+            (checkpoint / "action_contract.json").write_text(json.dumps(contract), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "noise_width"):
+                _validate_checkpoint_action_contract(checkpoint, progress)
+
+            contract["noise_width"] = 20
+            del contract["loss_dimensions"]
+            (checkpoint / "action_contract.json").write_text(json.dumps(contract), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                _validate_checkpoint_action_contract(checkpoint, progress)
+
+    def test_external_prediction_contract_is_exactly_five_dimensions(self):
+        stream = io.StringIO()
+        metadata = {"sample_id": "sample", "map_name": SEEN_MAPS[0]}
+        with self.assertRaisesRegex(ValueError, "exactly 5"):
+            _write_prediction(stream, metadata, [0.0] * 4)
+        _write_prediction(stream, metadata, [0.0] * 5)
+        row = json.loads(stream.getvalue())
+        self.assertEqual(
+            {key for key in row if key.startswith("pred_")},
+            {"pred_x", "pred_y", "pred_z", "pred_pitch", "pred_yaw"},
+        )
+
+    def test_inference_metadata_declares_native_adaptation_and_state(self):
+        class Dataset:
+            limit_per_map = None
+
+            def __len__(self):
+                return 20
+
+        metadata = _expected_metadata(
+            args=SimpleNamespace(seed=0, smoke=False),
+            checkpoint=Path("/tmp/seen10-checkpoint"),
+            progress={
+                "checkpoint_id": "checkpoint-id",
+                "global_step": 10,
+                "seed": 0,
+                "smoke": False,
+                "data_root": "/data",
+            },
+            data_root=Path("/data"),
+            dataset=Dataset(),
+            batch_size=4,
+            steps=10,
+            world_size=1,
+            inference_seed=42,
+            action_contract={
+                "mode": "official_auto",
+                "real_action_dim": 5,
+                "max_action_dim": 20,
+                "num_actions": 1,
+                "use_proprio": False,
+            },
+        )
+        self.assertEqual(metadata["action_adaptation"]["native_action_dim"], 20)
+        self.assertEqual(metadata["action_adaptation"]["trimmed_output_dim"], 5)
+        self.assertEqual(metadata["state"]["values"], "all zeros")
+        self.assertIsNone(metadata["normalization"]["epsilon"])
+        self.assertFalse(metadata["normalization"]["clamp"])
+        self.assertFalse(metadata["normalization"]["qnorm"])
+        self.assertEqual(metadata["inference"]["steps"], 10)
+        self.assertTrue(metadata["inference"]["native_width_preserved_through_all_steps"])
+        self.assertFalse(metadata["inference"]["model_only_channels_reset_each_step"])
+        self.assertEqual(metadata["action_adaptation"]["training_noise_width"], 20)
+        self.assertEqual(metadata["action_adaptation"]["supervised_loss_width"], 5)
+
+    def test_legacy_inference_metadata_discloses_dummy_channel_reset(self):
+        class Dataset:
+            limit_per_map = None
+
+            def __len__(self):
+                return 20
+
+        metadata = _expected_metadata(
+            args=SimpleNamespace(seed=0, smoke=False),
+            checkpoint=Path("/tmp/legacy-seen10-checkpoint"),
+            progress={"seed": 0, "smoke": False, "data_root": "/data"},
+            data_root=Path("/data"),
+            dataset=Dataset(),
+            batch_size=4,
+            steps=10,
+            world_size=1,
+            inference_seed=42,
+            action_contract={
+                "mode": "legacy_reset_dummy",
+                "real_action_dim": 5,
+                "max_action_dim": 20,
+                "num_actions": 1,
+                "use_proprio": False,
+            },
+        )
+        self.assertFalse(metadata["inference"]["native_width_preserved_through_all_steps"])
+        self.assertTrue(metadata["inference"]["model_only_channels_reset_each_step"])
+        self.assertEqual(metadata["action_adaptation"]["training_noise_width"], 5)
+
     def test_validation_reuses_generated_prediction_for_selected_row(self):
         class Model:
             def eval(self):

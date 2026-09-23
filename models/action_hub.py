@@ -45,6 +45,55 @@ def build_action_space(name: str, **kwargs) -> "BaseActionSpace":
     return ACTION_REGISTRY[key](**kwargs)
 
 
+def pad_action_to_model_dim(
+    action: torch.Tensor | None,
+    real_dim: int = 5,
+    model_dim: int = 20,
+) -> torch.Tensor | None:
+    """Pad an external action target to the model action width.
+
+    The Seen-10 contract keeps dataset targets at ``[..., 5]`` while the
+    native XVLA action encoder/decoder operates at ``[..., 20]``.  This
+    helper is deliberately explicit so callers can perform that conversion
+    immediately before ``XVLA.forward``.  A tensor that is already at the
+    model width is returned unchanged, which is required by the denoising
+    loop in ``official_auto``.
+
+    Only the two contract widths are accepted.  Silently truncating another
+    width would make a malformed batch look valid and could discard action
+    channels without an error.
+    """
+    if action is None:
+        return None
+    if not isinstance(action, torch.Tensor):
+        raise TypeError(f"action must be a torch.Tensor or None, got {type(action)!r}")
+    if action.ndim == 0:
+        raise ValueError("action must have a final feature dimension")
+    if not isinstance(real_dim, int) or not isinstance(model_dim, int):
+        raise TypeError("real_dim and model_dim must be integers")
+    if real_dim <= 0 or model_dim < real_dim:
+        raise ValueError(
+            f"Expected 0 < real_dim <= model_dim, got real_dim={real_dim}, model_dim={model_dim}"
+        )
+
+    width = action.size(-1)
+    if width == model_dim:
+        return action
+    if width != real_dim:
+        raise ValueError(
+            f"Expected action width {real_dim} or {model_dim}, got {width}"
+        )
+
+    pad_shape = (*action.shape[:-1], model_dim - real_dim)
+    return torch.cat((action, action.new_zeros(pad_shape)), dim=-1)
+
+
+# A descriptive alias for callers that do not need to know the historical
+# helper name.  Keep both names stable because the action contract is used by
+# training and inference adapters outside this module.
+pad_action_for_model = pad_action_to_model_dim
+
+
 # =============================================================================
 # Base class
 # =============================================================================
@@ -267,11 +316,16 @@ class AGIBOTEE6DActionSpace(BaseActionSpace):
 @register_action("auto")
 class AutoActionSpace(BaseActionSpace):
     """
-    Auto-detecting action space that adapts to any action dimension.
+    Legacy auto action space that adapts to any action dimension.
 
     - Model outputs max_dim for compatibility with pretrained models
     - Loss is computed only on the first real_dim dimensions
-    - Postprocess trims output back to real_dim
+    - Preprocess trims model-width actions to real_dim and pads them back
+
+    This is the behavior shipped on ``main@4aed8865``.  In particular, a
+    model-width denoising action has its dummy channels reset to zero at every
+    step.  Keep it available for exact compatibility, while Seen-10 uses the
+    ``official_auto`` implementation below.
 
     Args:
         real_dim: The actual action dimension from the dataset/policy feature
@@ -280,7 +334,7 @@ class AutoActionSpace(BaseActionSpace):
 
     JOINTS_SCALE = 100.0
 
-    def __init__(self, real_dim: int, max_dim: int = 20):
+    def __init__(self, real_dim: int = 5, max_dim: int = 20):
         super().__init__()
         self.real_dim = real_dim
         self.dim_action = max_dim  # Model-facing dimension
@@ -352,6 +406,112 @@ class AutoActionSpace(BaseActionSpace):
         return self._trim_to_real_dim(action)
 
 
+# Stable compatibility name for callers that want to make the legacy reset
+# behavior explicit.  ``auto`` remains registered for old checkpoints and
+# command lines; both names intentionally construct the same implementation.
+ACTION_REGISTRY["legacy_reset_dummy"] = AutoActionSpace
+LegacyResetDummyActionSpace = AutoActionSpace
+
+
+@register_action("official_auto")
+class OfficialAutoActionSpace(BaseActionSpace):
+    """Native-width action space for an external lower-dimensional target.
+
+    ``XVLA`` always owns a model-width action head.  For Seen-10, the dataset
+    target is ``[..., 5]`` but the action encoder/decoder remain ``[..., 20]``.
+    Call :func:`pad_action_to_model_dim` (or ``pad_to_model_dim`` on this
+    instance) at the model boundary.  The preprocessor also accepts a raw 5D
+    target as a compatibility fallback for existing callers; once an action is
+    20D it is returned *unchanged*.  That identity path is what lets the
+    iterative generation loop carry information in the final 15 channels.
+
+    The supervised loss only observes the first ``real_dim`` channels, and
+    postprocessing exposes those channels back to the task API.
+    """
+
+    JOINTS_SCALE = 100.0
+    dim_proprio = 20
+
+    def __init__(self, real_dim: int = 5, max_dim: int = 20):
+        super().__init__()
+        if not isinstance(real_dim, int) or not isinstance(max_dim, int):
+            raise TypeError("real_dim and max_dim must be integers")
+        if real_dim <= 0 or max_dim < real_dim:
+            raise ValueError(
+                f"Expected 0 < real_dim <= max_dim, got real_dim={real_dim}, max_dim={max_dim}"
+            )
+        self.real_dim = real_dim
+        self.dim_action = max_dim
+        self.mse = nn.MSELoss()
+
+    def pad_to_model_dim(self, action: torch.Tensor | None) -> torch.Tensor | None:
+        """Convert an external target to this action space's model width."""
+        return pad_action_to_model_dim(
+            action,
+            real_dim=self.real_dim,
+            model_dim=self.dim_action,
+        )
+
+    # Keep the private spelling used by the legacy implementation available
+    # to adapter code that treats both Auto action spaces uniformly.
+    _pad_to_model_dim = pad_to_model_dim
+
+    def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Return MSE on the real target channels, scaled by 100.
+
+        ``target`` may stay at its external width (5D) or already be padded to
+        model width (20D).  The trailing model-only channels are deliberately
+        excluded from the loss even when they contain nonzero predictions.
+        """
+        if not isinstance(pred, torch.Tensor) or not isinstance(target, torch.Tensor):
+            raise TypeError("pred and target must be torch.Tensor instances")
+        if pred.ndim == 0 or target.ndim == 0:
+            raise ValueError("pred and target must have a final feature dimension")
+        if pred.shape[:-1] != target.shape[:-1]:
+            raise ValueError(
+                f"pred/target leading shapes must match, got {pred.shape} and {target.shape}"
+            )
+        if pred.size(-1) < self.real_dim or target.size(-1) < self.real_dim:
+            raise ValueError(
+                f"pred and target must contain at least {self.real_dim} action channels, "
+                f"got {pred.size(-1)} and {target.size(-1)}"
+            )
+
+        joints_loss = self.mse(
+            pred[..., : self.real_dim],
+            target[..., : self.real_dim],
+        ) * self.JOINTS_SCALE
+        return {"joints_loss": joints_loss}
+
+    def preprocess(
+        self,
+        proprio: torch.Tensor,
+        action: torch.Tensor,
+        mode: str = "train",
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Prepare an action while preserving already model-width values.
+
+        ``XVLA.generate_actions`` feeds a 20D denoising state here on every
+        iteration.  Returning it unchanged is essential: zero-padding it on
+        each iteration would erase the learned dummy-channel state.
+        """
+        if action is None:
+            raise ValueError("action must be a tensor")
+        if action.size(-1) == self.dim_action:
+            return proprio, action
+        return proprio, self.pad_to_model_dim(action)
+
+    def postprocess(self, action: torch.Tensor) -> torch.Tensor:
+        """Expose only the real task channels to callers."""
+        if not isinstance(action, torch.Tensor) or action.ndim == 0:
+            raise ValueError("action must be a tensor with a final feature dimension")
+        if action.size(-1) < self.real_dim:
+            raise ValueError(
+                f"action must contain at least {self.real_dim} channels, got {action.size(-1)}"
+            )
+        return action[..., : self.real_dim]
+
+
 
 # =============================================================================
 # Exports
@@ -360,9 +520,13 @@ __all__ = [
     "BaseActionSpace",
     "build_action_space",
     "register_action",
+    "pad_action_to_model_dim",
+    "pad_action_for_model",
     "EE6DActionSpace",
     "JointActionSpace",
     "AGIBOTEE6DActionSpace",
     "AutoActionSpace",
+    "LegacyResetDummyActionSpace",
+    "OfficialAutoActionSpace",
     "ACTION_REGISTRY",
 ]

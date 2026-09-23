@@ -1,0 +1,221 @@
+{
+  "schema": "xvla_csgo_seen10_fair_v1",
+  "task": {
+    "benchmark": "csgo_benchmark_v2",
+    "name": "Seen-10 localization",
+    "scope": "seen10_only",
+    "maps": [
+      "cs_agency",
+      "cs_italy",
+      "de_ancient",
+      "de_anubis",
+      "de_dust2",
+      "de_inferno",
+      "de_mirage",
+      "de_nuke",
+      "de_overpass",
+      "de_train"
+    ],
+    "train_split": "seen_train",
+    "validation_split": "seen_validation",
+    "test_split": "seen_discrete_test"
+  },
+  "data": {
+    "root": "/home/jiahao/task/UniLIP/data/csgo_benchmark_v2",
+    "train_split": "seen_train",
+    "validation_split": "seen_validation",
+    "test_split": "seen_discrete_test",
+    "num_workers": 4,
+    "pin_memory": true,
+    "limit_per_map": null
+  },
+  "model": {
+    "pretrained": "pretrained/X-VLA-Pt",
+    "action_mode": "official_auto",
+    "action_contract": "official_auto",
+    "real_action_dim": 5,
+    "max_action_dim": 20,
+    "model_action_dim": 20,
+    "num_actions": 1,
+    "use_proprio": false,
+    "processor_image_size_expected": 224,
+    "padding": "pad_before_noise",
+    "noise_action_dim": 20,
+    "loss": "valid_action_mse",
+    "loss_dimensions": 5,
+    "dummy_channels_in_loss": false,
+    "dummy_loss_weight": 0.0,
+    "inference_reset": false,
+    "reset_dummy_for_inference": false,
+    "inference_steps": 10,
+    "pretrained_repo_id": "2toINF/X-VLA-Pt",
+    "pretrained_revision": "c1c4a64a7e03ac5b95c468bf1578f3d03651b53b",
+    "pretrained_weights_sha256": "433acffc992f457b1737d35ae20f81a895521f38eadaf03c736b6c0b0af1c93e",
+    "objective": "x0_clean_action_denoising_regression",
+    "target_pad_before_noise": true,
+    "loss_action_dim": 5,
+    "loss_scale": 100.0
+  },
+  "action_contract": {
+    "mode": "official_auto",
+    "external_action_dim": 5,
+    "model_action_dim": 20,
+    "num_actions": 1,
+    "external_order": [
+      "x",
+      "y",
+      "z",
+      "pitch",
+      "yaw"
+    ],
+    "objective": "x0_clean_action_denoising_regression",
+    "target_pad_before_noise": true,
+    "padding": "pad_before_noise",
+    "noise_width": 20,
+    "prediction_width": 20,
+    "loss": "valid_action_mse",
+    "loss_dimensions": 5,
+    "loss_scale": 100.0,
+    "dummy_channels_in_loss": false,
+    "dummy_loss_weight": 0.0,
+    "inference_reset": false,
+    "inference_steps": 10,
+    "final_output_dim": 5
+  },
+  "training": {
+    "output_root": "outputs/csgo_benchmark_v2_seen10/X-VLA-fair",
+    "smoke_output_root": "outputs/csgo_benchmark_v2_seen10_smoke/X-VLA-fair",
+    "batch_size": 4,
+    "smoke_batch_size": 2,
+    "effective_batch_size": 128,
+    "global_batch_size": 128,
+    "gradient_accumulation_steps": 32,
+    "gradient_accumulation_reference_world_size": 1,
+    "iters": 19500,
+    "smoke_iters": 2,
+    "learning_rate": 0.0001,
+    "lr_schedule": "constant",
+    "learning_coef": 1.0,
+    "weight_decay": 0.0,
+    "betas": [
+      0.9,
+      0.95
+    ],
+    "max_grad_norm": 1.0,
+    "freeze_steps": 1000,
+    "warmup_steps": 0,
+    "use_cosine_decay": false,
+    "min_lr_ratio": 1.0,
+    "eval_interval": 3900,
+    "smoke_eval_interval": 1,
+    "save_interval": 3900,
+    "max_periodic_checkpoints": 5,
+    "log_interval": 20,
+    "num_workers": 4,
+    "smoke_limit_per_map": 8,
+    "validation_seed": 1729,
+    "mixed_precision": "bf16",
+    "training_policy": "fair_v1",
+    "augmentation": {
+      "enabled": true,
+      "training_only": true,
+      "name": "native_color_jitter"
+    },
+    "lora": {
+      "enabled": true,
+      "r": 32,
+      "alpha": 64,
+      "dropout": 0.05,
+      "bias": "none",
+      "target_modules": "(?:vlm\\.language_model\\.model\\.encoder\\.layers\\.\\d+\\.(?:self_attn\\.(?:q_proj|k_proj|v_proj|out_proj)|fc1|fc2)|transformer\\.blocks\\.\\d+\\.(?:attn\\.(?:qkv|proj)|mlp\\.(?:fc1|fc2)))",
+      "modules_to_save": [
+        "vlm.image_proj_norm",
+        "transformer.vlm_proj",
+        "transformer.aux_visual_proj",
+        "transformer.action_encoder",
+        "transformer.action_decoder",
+        "transformer.norm",
+        "transformer.soft_prompt_hub"
+      ],
+      "extra_trainable_parameters": [
+        "vlm.image_projection"
+      ]
+    },
+    "trainable_phases": {
+      "requires_grad": [
+        "llm_lora",
+        "action_expert_lora",
+        "soft_prompt",
+        "action_heads",
+        "vision_language_connector",
+        "action_connector"
+      ],
+      "steps_0_999_lr_1e-4": [
+        "soft_prompt",
+        "action_heads"
+      ],
+      "steps_0_999_lr_0": [
+        "llm_lora",
+        "action_expert_lora",
+        "vision_language_connector",
+        "action_connector"
+      ],
+      "steps_1000_plus_lr_1e-4": "all_requires_grad"
+    },
+    "checkpoint_policy": {
+      "primary": "last",
+      "late": "last",
+      "best": "validation_only",
+      "periodic_keep": 5
+    },
+    "checkpoint_selection": {
+      "main": "late/last",
+      "best": "validation_only"
+    },
+    "localization_samples_per_update": 128,
+    "localization_sample_exposures": 2496000,
+    "updates_per_epoch": 390,
+    "epochs": 50,
+    "dropped_tail_samples_per_epoch": 80
+  },
+  "inference": {
+    "batch_size": 1,
+    "smoke_batch_size": 2,
+    "steps": 10,
+    "seed": 42,
+    "num_workers": 0,
+    "reset": false,
+    "reset_dummy": false
+  },
+  "normalization": {
+    "space": "normalized absolute xyzhw",
+    "x_y": "world coordinate / 1024",
+    "z": "(world z - published map z_min) / (published map z_max - published map z_min)",
+    "pitch_yaw": "radians / (2*pi)",
+    "pitch_metric": "linear error in normalized coordinates",
+    "yaw_metric": "circular shortest-arc error with normalized period 1",
+    "epsilon": null,
+    "clamp": false,
+    "qnorm": false,
+    "quantile_statistics": null,
+    "train_test_contract": "same published per-map exact calibration"
+  },
+  "state": {
+    "robot_state_information": "absent",
+    "use_real_robot_state": false,
+    "proprio_tensor": "zeros[20]",
+    "proprio_dim": 20,
+    "proprio_structure": "preserved_for_pretrained_72d_encoder",
+    "action_encoder_input": "action20 + zero_proprio20 + sinusoidal_time32 = 72D",
+    "use_proprio": false,
+    "dim": 20,
+    "values": "all zeros"
+  },
+  "visualization": {
+    "enabled": true,
+    "samples_per_map": 10,
+    "seed": 20260915,
+    "radar_size": 1800,
+    "fpv_width": 480
+  }
+}

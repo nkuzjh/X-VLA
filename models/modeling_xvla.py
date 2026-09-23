@@ -57,14 +57,14 @@ class XVLA(PreTrainedModel):
         self.use_proprio: bool = config.use_proprio
         self.action_mode: str = config.action_mode.lower()
         # Action space (dimensions + hooks)
-        if config.action_mode.lower() == "auto":
+        if self.action_mode in {"auto", "legacy_reset_dummy", "official_auto"}:
             self.action_space = build_action_space(
-                config.action_mode.lower(),
+                self.action_mode,
                 real_dim=config.real_action_dim,
                 max_dim=config.max_action_dim,
             )
         else:
-            self.action_space = build_action_space(config.action_mode.lower())
+            self.action_space = build_action_space(self.action_mode)
         dim_action = self.action_space.dim_action
         dim_proprio = getattr(self.action_space, "dim_proprio", dim_action)
 
@@ -159,6 +159,12 @@ class XVLA(PreTrainedModel):
         2) Diffusion-style noisy mixture of actions: x_t = t*noise + (1-t)*gt.
         3) Space-specific preprocessing, prediction, and supervised loss.
         """
+        if self.action_mode == "official_auto" and action.size(-1) != self.action_space.dim_action:
+            raise ValueError(
+                "official_auto requires the external target to be padded before XVLA.forward so "
+                f"noise is sampled at the native {self.action_space.dim_action}D width; "
+                f"received {action.size(-1)}D"
+            )
         enc = self.forward_vlm(input_ids, image_input, image_mask)
 
         B = input_ids.shape[0]

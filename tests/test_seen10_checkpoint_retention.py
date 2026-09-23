@@ -40,7 +40,7 @@ class CheckpointRetentionTest(unittest.TestCase):
                 self.assertEqual(metadata["checkpoint_id"], "checkpoint-id")
                 self.assertEqual(metadata["global_step"], 10000)
 
-    def test_keeps_recent_five_and_older_best(self):
+    def test_keeps_five_total_including_older_best_and_last(self):
         with tempfile.TemporaryDirectory() as temporary:
             output_root = Path(temporary)
             checkpoints = output_root / "checkpoints"
@@ -63,7 +63,6 @@ class CheckpointRetentionTest(unittest.TestCase):
                 kept,
                 {
                     "step_00000001",
-                    "step_00000003",
                     "step_00000004",
                     "step_00000005",
                     "step_00000006",

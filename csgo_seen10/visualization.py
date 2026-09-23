@@ -84,17 +84,27 @@ def build_inference_visualization_rows(
             values = [float(row[field]) for field in POSE_FIELDS]
             if not all(math.isfinite(value) for value in values):
                 raise ValueError(f"Nonfinite visualization prediction at line {line_number}: {identity}")
+            if identity in predictions:
+                raise ValueError(f"Duplicate visualization prediction at line {line_number}: {identity}")
             predictions[identity] = values
 
     split_rows = {}
     for map_name in SEEN_MAPS:
         split_path = dataset.data_root / "splits" / "seen" / map_name / f"{dataset.split}.json"
-        with split_path.open(encoding="utf-8") as stream:
-            rows = json.load(stream)
+        if not split_path.is_file():
+            split_path = split_path.with_suffix(".jsonl")
+        if split_path.suffix == ".jsonl":
+            with split_path.open(encoding="utf-8") as stream:
+                rows = [json.loads(line) for line in stream if line.strip()]
+        else:
+            with split_path.open(encoding="utf-8") as stream:
+                rows = json.load(stream)
         for row in rows:
             identity = (map_name, str(row.get("sample_id", row["file_frame"])))
             if identity not in selected_set:
                 continue
+            if identity in split_rows:
+                raise ValueError(f"Duplicate visualization ground truth: {identity}")
             low, high = dataset.z_ranges[map_name]
             split_rows[identity] = [
                 float(row["x"]) / 1024.0,
@@ -211,6 +221,8 @@ def render_map_visualizations(
         "requested_samples_per_map": int(samples_per_map),
         "pose_order": "xyzhw = x, y, z, pitch, yaw; angles shown in degrees",
         "layout": "radar left, FPV column right; GT solid, prediction hollow",
+        "fpv_text_alignment": "top center",
+        "sample_colors": len(SAMPLE_COLORS),
         "maps": {
             map_name: [str(row["sample_id"]) for row in grouped[map_name]]
             for map_name in SEEN_MAPS
@@ -287,7 +299,9 @@ def render_map_visualizations(
             pred = normalized_to_physical(pred_norm, map_name, dataset.z_ranges)
             gt_label = "gt_xyzhw   [" + ",".join(f"{value:.1f}" for value in gt) + "]"
             pred_label = "pred_xyzhw [" + ",".join(f"{value:.1f}" for value in pred) + "]"
-            text_center_x = (32 + fpv_width) / 2
+            # Keep both pose labels centered in the FPV tile.  The color tag
+            # stays at the left edge and does not shift the text alignment.
+            text_center_x = fpv_width / 2
             _text(fpv_draw, (text_center_x, 5), gt_label, body_font, anchor="mt")
             _text(fpv_draw, (text_center_x, 25), pred_label, body_font, anchor="mt")
             canvas.paste(fpv, (radar_size, index * row_height))

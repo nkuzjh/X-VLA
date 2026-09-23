@@ -18,6 +18,8 @@ export PYTHONDONTWRITEBYTECODE=1
 usage() {
     cat <<'EOF'
 Usage: bash scripts/run_csgo_seen10.sh {train|infer|eval|smoke} [--seed N]
+  Default configuration: configs/csgo_seen10.json (initial legacy integration)
+  Fair aligned experiment: add --config configs/csgo_seen10_xvla_fair.json
   --config FILE        Configuration file
   --data-root DIR      Published, read-only Benchmark v2 data
   --pretrained DIR     Native pretrained X-VLA (train/smoke)
@@ -79,10 +81,25 @@ case "$COMMAND" in
         ;;
 esac
 
-FORMAL_ROOT="$PROJECT_ROOT/outputs/csgo_benchmark_v2_seen10/X-VLA/seed_$SEED"
+mapfile -t CONFIG_OUTPUT_ROOTS < <(python3 - "$CONFIG" "$PROJECT_ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config_path, project_root = Path(sys.argv[1]), Path(sys.argv[2])
+config = json.loads(config_path.read_text(encoding="utf-8"))
+for key in ("output_root", "smoke_output_root"):
+    value = Path(config["training"][key]).expanduser()
+    if not value.is_absolute():
+        value = project_root / value
+    print(value.resolve())
+PY
+)
+FORMAL_ROOT="${CONFIG_OUTPUT_ROOTS[0]}/seed_$SEED"
+SMOKE_ROOT="${CONFIG_OUTPUT_ROOTS[1]}/seed_$SEED"
 if [[ -z "$OUTPUT_ROOT" ]]; then
     if [[ "$COMMAND" == smoke ]]; then
-        OUTPUT_ROOT="$PROJECT_ROOT/outputs/csgo_benchmark_v2_seen10_smoke/X-VLA/seed_$SEED/run_$(date -u +%Y%m%dT%H%M%SZ)_$$"
+        OUTPUT_ROOT="$SMOKE_ROOT/run_$(date -u +%Y%m%dT%H%M%SZ)_$$"
     else
         OUTPUT_ROOT="$FORMAL_ROOT"
     fi

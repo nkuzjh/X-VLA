@@ -10,13 +10,16 @@
   },
   "model": {
     "pretrained": "pretrained/X-VLA-Pt",
-    "action_mode": "auto",
+    "action_mode": "legacy_reset_dummy",
+    "action_contract": "legacy_reset_dummy",
     "real_action_dim": 5,
     "max_action_dim": 20,
     "num_actions": 1,
     "use_proprio": false,
     "processor_image_size_expected": 224,
-    "inference_steps": 10
+    "inference_steps": 10,
+    "inference_reset": true,
+    "reset_dummy_for_inference": true
   },
   "training": {
     "output_root": "outputs/csgo_benchmark_v2_seen10/X-VLA",
@@ -28,7 +31,10 @@
     "learning_rate": 0.0001,
     "learning_coef": 1.0,
     "weight_decay": 0.0,
-    "betas": [0.9, 0.95],
+    "betas": [
+      0.9,
+      0.95
+    ],
     "max_grad_norm": 1.0,
     "freeze_steps": 1000,
     "warmup_steps": 2000,
@@ -43,14 +49,32 @@
     "smoke_limit_per_map": 8,
     "validation_seed": 1729,
     "gradient_accumulation_steps": 1,
-    "mixed_precision": "no"
+    "mixed_precision": "no",
+    "effective_batch_size": 4,
+    "gradient_accumulation_reference_world_size": 1,
+    "training_policy": "legacy_reproducible",
+    "augmentation": {
+      "enabled": false,
+      "training_only": true
+    },
+    "lora": {
+      "enabled": false
+    },
+    "checkpoint_policy": {
+      "primary": "best",
+      "best": "validation_only",
+      "late": "last"
+    }
   },
   "inference": {
-    "batch_size": 4,
+    "batch_size": 1,
     "smoke_batch_size": 2,
     "steps": 10,
     "seed": 42,
-    "num_workers": 4
+    "num_workers": 0,
+    "reset": true,
+    "reset_dummy": true,
+    "checkpoint": "best"
   },
   "visualization": {
     "enabled": true,
@@ -58,5 +82,13 @@
     "seed": 20260915,
     "radar_size": 1800,
     "fpv_width": 480
+  },
+  "task": {
+    "benchmark": "csgo_benchmark_v2",
+    "name": "Seen-10 localization",
+    "scope": "seen10_only",
+    "train_split": "seen_train",
+    "validation_split": "seen_validation",
+    "test_split": "seen_discrete_test"
   }
 }
