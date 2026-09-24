@@ -20,6 +20,7 @@ usage() {
 Usage: bash scripts/run_csgo_seen10.sh {train|infer|eval|smoke} [--seed N]
   Default configuration: configs/csgo_seen10.json (initial legacy integration)
   Fair aligned experiment: add --config configs/csgo_seen10_xvla_fair.json
+  Frozen V-L connector aligned: add --config configs/csgo_seen10_xvla_fair_frozen_vl.json
   --config FILE        Configuration file
   --data-root DIR      Published, read-only Benchmark v2 data
   --pretrained DIR     Native pretrained X-VLA (train/smoke)

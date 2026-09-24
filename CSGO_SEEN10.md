@@ -6,14 +6,15 @@
 
 CSGO Benchmark v2 用第一视角图像（FPV）、对应地图 radar 和定位指令，要求模型预测相机在地图中的位置和朝向。X-VLA 的接入目标是复用官方数据划分、样本 ID、5D 位姿定义和官方评测器，形成可重复的 Seen-10 定位训练、推理和评测流程。
 
-本项目保留两套可运行实验：
+本项目保留三套可运行实验：
 
 | 实验 | 用途 | 配置 | 输出目录 | 默认 checkpoint |
 | --- | --- | --- | --- | --- |
 | 初次接入 legacy | 复现工作区最初的 X-VLA 接入行为 | `configs/csgo_seen10.json` | `outputs/csgo_benchmark_v2_seen10/X-VLA/seed_0` | `best` |
-| 当前公平对比 aligned | 与 UniLIP 定位实验进行主要对比 | `configs/csgo_seen10_xvla_fair.json` | `outputs/csgo_benchmark_v2_seen10/X-VLA-fair/seed_0` | `last` |
+| 原 aligned（连接器可训练） | 保留已有 aligned 设置，作为连接器训练策略对照 | `configs/csgo_seen10_xvla_fair.json` | `outputs/csgo_benchmark_v2_seen10/X-VLA-fair/seed_0` | `last` |
+| 新 aligned-frozen-vl（连接器冻结） | 视觉—语言连接器冻结，与 `exp32_loc` 对齐 | `configs/csgo_seen10_xvla_fair_frozen_vl.json` | `outputs/csgo_benchmark_v2_seen10/X-VLA-fair-frozen-vl/seed_0` | `last` |
 
-公平对比的主要对象是 UniLIP `exp32_loc` 定位-only 实验；UniLIP `exp32` 的定位结果作为联合生成+定位的次要参考。生成任务、`exp32_gen` 和其他生成模型不在本次接入范围内。两套 X-VLA 实验共享官方 Seen-10 数据、外部 5D 定位目标、测试协议和评测指标；X-VLA 原生的 action head、去噪目标、推理步数和优化稳定性设置作为模型差异保留。
+公平对比的主要对象是 UniLIP `exp32_loc` 定位-only 实验；UniLIP `exp32` 的定位结果作为联合生成+定位的次要参考。生成任务、`exp32_gen` 和其他生成模型不在本次接入范围内。三套 X-VLA 实验共享官方 Seen-10 数据、外部 5D 定位目标、测试协议和评测指标；X-VLA 原生的 action head、去噪目标、推理步数和优化稳定性设置作为模型差异保留。
 
 ## 2. 数据、地图和输入输出边界
 
@@ -35,7 +36,7 @@ Seen-10 使用以下 10 张地图：`cs_agency`、`cs_italy`、`de_ancient`、`d
 
 模型不接收 GT 坐标、历史位姿、测试集统计量或其他额外状态。外部定位目标是单步 5D pose：`[x, y, z, pitch, yaw]`，`action_horizon=1`。推理文件保存归一化后的 5D 预测，官方评测器负责统一反归一化并计算物理空间指标。
 
-## 3. 两套实验的技术行为
+## 3. 三套实验的技术行为
 
 ### 初次接入 legacy
 
@@ -43,7 +44,7 @@ legacy 使用 `legacy_reset_dummy` action 路径，保留初次接入时的 5D �
 
 legacy 推理默认读取 validation 选择的 `best` checkpoint。旧配置的输出目录和默认参数保持独立，因此不会覆盖 aligned 实验的结果。
 
-### 当前公平对比 aligned
+### 两种公平对比 aligned 的共同设置
 
 aligned 数据侧先生成 5D pose，再在进入 `XVLA.forward` 前一次性补成 `[5D pose, 15D zeros]` 的 20D action。训练和推理的噪声、`x_t`、预测值以及原生 10 步 refinement 始终使用完整 20D；推理过程中不重复清零后 15D，最终只裁剪前 5D 作为定位结果。
 
@@ -61,11 +62,11 @@ yaw'   = yaw / (2*pi)
 
 三套 split 使用同一套按地图冻结的发布标定。X-VLA 原生路径不使用 qnorm、clamp 或额外的 Z epsilon；这保持为 X-VLA 与 UniLIP pi0.5 定位 head 之间的模型差异。
 
-aligned 训练集使用 X-VLA 原生 `ColorJitter(0.2, 0.2, 0.2, 0)`，验证和测试使用确定性预处理，图像尺寸为 224。视觉 encoder 冻结；LLM 和 action expert 的 base 参数冻结并使用 `r=32`、`alpha=64`、`dropout=0.05`、`bias=none` 的 LoRA；视觉到语言 connector、action connector、action encoder/decoder、action norm、action head 和 soft prompt 全量训练。推理仍使用 X-VLA 原生 10 步，不为了复制 UniLIP 定位 head 而改成其他步数。
+aligned 训练集使用 X-VLA 原生 `ColorJitter(0.2, 0.2, 0.2, 0)`，验证和测试使用确定性预处理，图像尺寸为 224。视觉 encoder 冻结；LLM 和 action expert 的 base 参数冻结并使用 `r=32`、`alpha=64`、`dropout=0.05`、`bias=none` 的 LoRA；action connector、action encoder/decoder、action norm、action head 和 soft prompt 全量训练。视觉—语言 connector 的训练策略是两种 aligned 实验之间的方法差异，见下表；验证与保存时间点另见第 4 节。推理仍使用 X-VLA 原生 10 步，不为了复制 UniLIP 定位 head 而改成其他步数。
 
-两套实验的关键差异如下：
+legacy 与原 aligned 的关键差异如下；新 aligned-frozen-vl 在此基础上冻结视觉—语言连接器，并将验证与保存间隔改为 4,000 updates：
 
-| 项目 | 初次接入 legacy | 公平对比 aligned |
+| 项目 | 初次接入 legacy | 原 aligned（连接器可训练） |
 | --- | --- | --- |
 | 定位预算 | 50,000 updates，单进程有效 batch 4 | 19,500 updates，有效 batch 128 |
 | Action 适配 | 推理每轮只保留前 5D，再把后 15D 补零 | 进入 forward 前补零一次，完整 20D 参与训练加噪和全部推理迭代 |
@@ -78,17 +79,45 @@ aligned 训练集使用 X-VLA 原生 `ColorJitter(0.2, 0.2, 0.2, 0)`，验证和
 
 aligned 对齐的是 `exp32_loc` 的数据、输入信息、5D 目标、定位样本暴露量、有效 batch、optimizer update 数、checkpoint 密度和评测协议。X-VLA 的 20D action head、clean-action denoising objective、原生 10 步求解以及优化器稳定设置仍按模型原生行为保留。它们属于需要在结果表中披露的模型差异。
 
+### 新实验 aligned-frozen-vl：冻结视觉—语言连接器
+
+新实验显式设置 `training.freeze_vision_language_connector=true`，冻结 Florence 视觉特征进入语言 backbone 之前的 `vlm.image_projection` 和 `vlm.image_proj_norm`。这两部分全程 `requires_grad=false`，不进入 optimizer，也不插入 LoRA；训练到第 1,000 个 update 后仍保持冻结。配置未设置该开关时默认为 `false`，原 aligned 行为保持兼容。
+
+| 模块/设置 | 原 aligned | 新 aligned-frozen-vl | UniLIP exp32_loc 对应功能 |
+| --- | --- | --- | --- |
+| 视觉 encoder | 冻结 | 冻结 | 冻结 |
+| 视觉—语言连接器 | 全量可训练，前 1,000 updates 的 LR 为 0 | 全程冻结 | InternVL multimodal projector 冻结 |
+| 语言 backbone | base 冻结，LoRA 可训练 | 相同 | base 冻结，LoRA 可训练 |
+| Action expert | base 冻结，LoRA 可训练 | 相同 | base 冻结，LoRA 可训练 |
+| Action connector / 维度转换层 | 全量可训练 | 相同 | 对应定位连接/转换层可训练 |
+| X-VLA soft prompt | 可训练 | 相同 | 不强行对应 |
+| 验证与保存 | 每 3,900 updates | 每 4,000 updates，最终 19,500 补做一次 | 维持约 5 次 checkpoint 搜索机会 |
+| 数据、增强、action 目标、LR、训练预算、推理与评测 | 本文 aligned 设置 | 相同 | 仅按功能比较；模型原生差异仍保留 |
+
+`transformer.vlm_proj` 和 `transformer.aux_visual_proj` 是连接到 action expert 的投影，属于 action connector，仍可训练。它们不属于本次冻结的视觉—语言连接器。
+
+新实验的 LoRA `modules_to_save` 排除 `vlm.image_proj_norm`，`extra_trainable_parameters` 为空；其余可训练模块沿用原 aligned。训练入口生成的 `parameter_audit.json` 应显示 `vision_language_connector` 的可训练参数数为 0，optimizer 中不应出现这一组。原生模型规模和前向结构保持不变，可训练参数数减少。
+
+新实验从 `pretrained/X-VLA-Pt` 初始化，使用独立输出目录；不能从原 aligned 的 CSGO checkpoint warm-start。`last` 用于主结果，`best` 仅作为 validation-best 附加结果。该实验用于比较连接器冻结策略；结果对比时也应注明验证/保存时间点的差异，其他模型原生差异仍然保留。
+
 ## 4. aligned 训练预算和 checkpoint
 
 aligned 的有效定位 batch 为 128 个样本，使用梯度累计适配可见 GPU 数量；总训练量为 19,500 个 optimizer updates，约 50 个 epoch，每个 epoch 390 个 update。每个 epoch 尾部不满有效 batch 的 80 条样本丢弃，不因 GPU 数量改变有效 batch 或总更新数。
 
-使用 AdamW、学习率 `1e-4`、betas `(0.9, 0.95)`、weight decay `0`、gradient clipping `1.0` 和 BF16。前 1,000 个 update 仅训练 soft prompt 和 action head，之后启用全部 aligned 可训练模块。每 3,900 个 update 做一次验证并保存 checkpoint，共在 3,900、7,800、11,700、15,600、19,500 处保存约 5 次；同时维护 `last` 和只依据 validation 选择的 `best` 指针。
+使用 AdamW、学习率 `1e-4`、betas `(0.9, 0.95)`、weight decay `0`、gradient clipping `1.0` 和 BF16。前 1,000 个 update 仅训练 soft prompt 和 action head，之后启用对应 aligned 配置中其余可训练模块；新实验的视觉—语言连接器始终冻结。
+
+| 实验 | 验证/保存间隔（optimizer updates） | 实际验证与保存的 step |
+| --- | --- | --- |
+| 原 aligned | 3,900 | 3,900、7,800、11,700、15,600、19,500 |
+| 新 aligned-frozen-vl | 4,000 | 4,000、8,000、12,000、16,000、19,500 |
+
+新实验的 `eval_interval` 和 `save_interval` 均为 4,000；训练结束时即使未满间隔，也会验证并保存 step 19,500。共保留这 5 个 step 目录。`best` 链接到其中 validation 最优的 step；`late` 与兼容现有命令的 `last` 链接到最新已保存的 step，训练完成后均指向 `step_00019500`。这些链接不额外复制 checkpoint。原 aligned 继续使用既有的 `best`/`last` 指针。
 
 论文或主表中的 aligned 主结果使用训练结束的 `last` checkpoint。若额外报告 `best`，必须明确标为 validation-best，不能查看测试集后选择。
 
 ## 5. 环境和权重准备
 
-以下准备命令对 legacy 和 aligned 共用。数据和官方评测器应当已经位于本文第 2 节所列路径。
+以下准备命令对三套实验共用，只需准备一次。数据和官方评测器应当已经位于本文第 2 节所列路径。
 
 ```bash
 cd /home/jiahao/task/X-VLA
@@ -96,7 +125,7 @@ bash scripts/setup_csgo_seen10.sh
 bash scripts/download_csgo_checkpoint.sh
 ```
 
-权重下载完成后，原始权重位于 `pretrained/X-VLA-Pt`。两套实验都必须从该原始 X-VLA 权重开始，不能用已经见过 CSGO Benchmark v2 的 checkpoint 继续初始化。
+权重下载完成后，原始权重位于 `pretrained/X-VLA-Pt`。三套实验都必须从该原始 X-VLA 权重开始，不能用已经见过 CSGO Benchmark v2 的 checkpoint 继续初始化。
 
 ## 6. 直接执行命令
 
@@ -120,7 +149,7 @@ bash scripts/run_csgo_seen10.sh eval --seed 0
 
 单 GPU 若要使用 Accelerate，应删除 `--multi_gpu` 并把 `--num_processes` 改为 1，同时按显存调整 `--batch-size`。默认推理和加速推理二选一，不要在同一个输出目录中混用两种推理方式。
 
-### 6.2 当前公平对比 aligned
+### 6.2 原 aligned（视觉—语言连接器可训练）
 
 aligned 在每条 legacy 命令上增加显式配置参数：
 
@@ -138,6 +167,26 @@ bash scripts/run_csgo_seen10.sh eval --config configs/csgo_seen10_xvla_fair.json
 
 单 GPU 若要使用 Accelerate，应删除 `--multi_gpu` 并把 `--num_processes` 改为 1，同时按显存调整 `--batch-size`。默认推理和加速推理二选一；aligned 结果应保持在 `X-VLA-fair/seed_0`，不要将两种推理方式混写到同一输出目录。
 
+### 6.3 新 aligned-frozen-vl（视觉—语言连接器冻结）
+
+使用相同启动入口，只需选择新配置。训练从原始预训练权重开始，输出到 `outputs/csgo_benchmark_v2_seen10/X-VLA-fair-frozen-vl/seed_0`：
+
+```bash
+bash scripts/run_csgo_seen10.sh train --config configs/csgo_seen10_xvla_fair_frozen_vl.json --seed 0
+bash scripts/run_csgo_seen10.sh infer --config configs/csgo_seen10_xvla_fair_frozen_vl.json --seed 0
+bash scripts/run_csgo_seen10.sh eval --config configs/csgo_seen10_xvla_fair_frozen_vl.json --seed 0
+```
+
+默认推理使用单进程、`batch_size=1`、`num_workers=0` 和本实验的 `last` checkpoint，不启用额外加速。两张可见 GPU 时可改用以下加速推理命令，每张 GPU 的 batch 为 8：
+
+```bash
+./.venv/bin/accelerate launch --multi_gpu --num_processes 2 infer_seen10.py --config configs/csgo_seen10_xvla_fair_frozen_vl.json --seed 0 --batch-size 8 --num-workers 4
+```
+
+单 GPU 使用 Accelerate 时删除 `--multi_gpu` 并将 `--num_processes` 改为 1，按显存调整 batch。默认与加速推理二选一，完成后使用上面的同一条 eval 命令。新实验输出目录与 legacy、原 aligned 均独立。
+
+### 6.4 推理与评测口径
+
 当前推理噪声按 batch 设置随机种子，因此改变 batch size 或进程数可能改变具体预测。正式结果必须预先选定一种推理命令，并对所有对比实验保持一致；不能在看到测试结果后切换推理方式。
 
 评测命令只读取对应输出目录中的 `localization/predictions.jsonl`，调用共享官方 evaluator，输出逐地图和 equal-map macro 的 XY、Z、Pitch、Yaw。Seen-10 每张地图固定为 2,000 条，因此这些均值指标的 pooled 结果与 equal-map macro 数值相同。指标越低越好。
@@ -148,7 +197,7 @@ bash scripts/run_csgo_seen10.sh eval --config configs/csgo_seen10_xvla_fair.json
 
 ```text
 train.log                         训练日志
-checkpoints/                      周期 checkpoint、last 和 best 指针
+checkpoints/                      周期 checkpoint、last 和 best 指针；新实验另有 late 别名
 localization/predictions.jsonl    测试集 5D 归一化预测
 localization/predictions.meta.json 推理配置和样本覆盖信息
 metrics/localization/             官方评测结果
@@ -177,6 +226,8 @@ visualizations/localization/      每张地图的可视化图片
 
 这组数值只代表初次接入 legacy，不应作为与 `exp32_loc` 公平比较的 X-VLA 主结果。当前文档要求的新默认推理为 `batch_size=1`；由于推理包含随机初始噪声，重新运行所得数值可能与上述已有 `batch_size=4` 结果不同。
 
-当前公平对比 aligned 实验尚未启动。aligned 的训练、推理和评测应按第 6.2 节命令执行，结果写入 `outputs/csgo_benchmark_v2_seen10/X-VLA-fair/seed_0`，不会覆盖 legacy 结果。
+原 aligned 已尝试正式训练，在 step 3,900 完成验证后因 checkpoint 合并时 CPU/GPU 设备不一致而中断；该次未留下可恢复的 step 3,900 权重。保存问题已修复，并通过独立小批量训练、验证、保存和断点恢复检查。这些小批量产物不属于正式实验结果。原 aligned 的 `seed_0` 已有日志等产物，重新训练须指定新的输出目录，并在后续推理/评测中使用同一目录。
+
+新 aligned-frozen-vl 尚未启动训练、推理或评测。验收后可按第 6.3 节命令执行；输出写入独立的 `X-VLA-fair-frozen-vl/seed_0`，保留原 aligned 作为连接器可训练的对照。
 
 本说明只描述正式实验入口和结果解释。正式训练、全量推理和评测由使用者根据验收安排手动启动；smoke 或单 batch 检查不能替代正式 Seen-10 结果。

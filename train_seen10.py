@@ -145,6 +145,9 @@ def _validate_config(config: dict) -> dict:
 
     policy = str(train_cfg.get("training_policy", _LEGACY_POLICY))
     if policy == _FAIR_POLICY:
+        frozen_vl_connector = train_cfg.get("freeze_vision_language_connector", False)
+        if not isinstance(frozen_vl_connector, bool):
+            raise ValueError("training.freeze_vision_language_connector must be a boolean")
         expected = {
             "mode": "official_auto",
             "padding": "pad_before_noise",
@@ -161,8 +164,8 @@ def _validate_config(config: dict) -> dict:
             "objective": "x0_clean_action_denoising_regression",
             "iters": 19500,
             "effective_batch_size": 128,
-            "eval_interval": 3900,
-            "save_interval": 3900,
+            "eval_interval": 4000 if frozen_vl_connector else 3900,
+            "save_interval": 4000 if frozen_vl_connector else 3900,
             "mixed_precision": "bf16",
         }
         actual = {
@@ -198,8 +201,13 @@ def _validate_config(config: dict) -> dict:
             "dropout": 0.05,
             "bias": "none",
             "target_modules": _FAIR_LORA_TARGET_REGEX,
-            "modules_to_save": list(_FAIR_MODULES_TO_SAVE),
-            "extra_trainable_parameters": list(_FAIR_EXTRA_TRAINABLE_PARAMETERS),
+            "modules_to_save": [
+                name for name in _FAIR_MODULES_TO_SAVE
+                if not (frozen_vl_connector and name == "vlm.image_proj_norm")
+            ],
+            "extra_trainable_parameters": (
+                [] if frozen_vl_connector else list(_FAIR_EXTRA_TRAINABLE_PARAMETERS)
+            ),
         }
         lora_mismatches = [
             f"lora.{key}={lora.get(key)!r}, expected={value!r}"
@@ -293,18 +301,19 @@ def _validate_config(config: dict) -> dict:
                 "action_expert_lora",
                 "soft_prompt",
                 "action_heads",
-                "vision_language_connector",
                 "action_connector",
             ],
             "steps_0_999_lr_1e-4": ["soft_prompt", "action_heads"],
             "steps_0_999_lr_0": [
                 "llm_lora",
                 "action_expert_lora",
-                "vision_language_connector",
                 "action_connector",
             ],
             "steps_1000_plus_lr_1e-4": "all_requires_grad",
         }
+        if not frozen_vl_connector:
+            expected_trainable_phases["requires_grad"].insert(4, "vision_language_connector")
+            expected_trainable_phases["steps_0_999_lr_0"].insert(2, "vision_language_connector")
         if train_cfg.get("trainable_phases") != expected_trainable_phases:
             raise ValueError("Fair Seen-10 trainable_phases does not match the executable LR/parameter policy")
         expected_checkpoint_policy = {
@@ -537,6 +546,13 @@ _FAIR_TRAINABLE_ROLES = {
 }
 
 
+def _fair_trainable_roles(train_cfg: dict) -> set[str]:
+    roles = set(_FAIR_TRAINABLE_ROLES)
+    if train_cfg.get("freeze_vision_language_connector", False):
+        roles.remove("vision_language_connector")
+    return roles
+
+
 def _configure_trainable_parameters(model, train_cfg: dict, policy: str) -> dict:
     """Set one stable requires-grad mask before DDP is constructed.
 
@@ -545,6 +561,7 @@ def _configure_trainable_parameters(model, train_cfg: dict, policy: str) -> dict
     parameters without distributed gradient hooks, so the fair trainable set
     stays fixed for the whole run.
     """
+    fair_roles = _fair_trainable_roles(train_cfg)
     by_role = {}
     total_elements = 0
     trainable_elements = 0
@@ -554,7 +571,7 @@ def _configure_trainable_parameters(model, train_cfg: dict, policy: str) -> dict
         if policy == _LEGACY_POLICY:
             enabled = True
         else:
-            enabled = role in _FAIR_TRAINABLE_ROLES and ".original_module." not in name
+            enabled = role in fair_roles and ".original_module." not in name
         parameter.requires_grad = enabled
         elements = int(parameter.numel())
         total_elements += elements
@@ -571,19 +588,24 @@ def _configure_trainable_parameters(model, train_cfg: dict, policy: str) -> dict
         raise ValueError("Seen-10 training policy leaves no trainable parameters")
     if policy == _FAIR_POLICY:
         missing = [
-            role for role in sorted(_FAIR_TRAINABLE_ROLES)
+            role for role in sorted(fair_roles)
             if by_role.get(role, {}).get("trainable", 0) == 0
         ]
         unexpected = [
             name for name in trainable_names
-            if _parameter_role(name) not in _FAIR_TRAINABLE_ROLES
+            if _parameter_role(name) not in fair_roles
         ]
         vision_trainable = by_role.get("vision_encoder", {}).get("trainable", 0)
-        if missing or unexpected or vision_trainable:
+        frozen_connector_trainable = (
+            by_role.get("vision_language_connector", {}).get("trainable", 0)
+            if train_cfg.get("freeze_vision_language_connector", False) else 0
+        )
+        if missing or unexpected or vision_trainable or frozen_connector_trainable:
             raise RuntimeError(
                 "Invalid fair trainable-parameter map: "
                 f"missing_roles={missing}, unexpected={unexpected[:8]}, "
-                f"vision_trainable={vision_trainable}"
+                f"vision_trainable={vision_trainable}, "
+                f"frozen_connector_trainable={frozen_connector_trainable}"
             )
     return {
         "policy": policy,
@@ -608,7 +630,7 @@ def _phase_metadata(train_cfg: dict, global_step: int, policy: str) -> dict:
         active = ["soft_prompt", "action_heads"]
         phase = "freeze_lr"
     else:
-        active = sorted(_FAIR_TRAINABLE_ROLES)
+        active = sorted(_fair_trainable_roles(train_cfg))
         phase = "all_fair_groups"
     return {
         "step": int(global_step),
@@ -618,15 +640,15 @@ def _phase_metadata(train_cfg: dict, global_step: int, policy: str) -> dict:
     }
 
 
-def _keep_frozen_vision_eval(model, policy: str):
+def _keep_frozen_vision_eval(model, policy: str, train_cfg: dict | None = None):
     """Keep frozen backbone dropout disabled while preserving trainable dropout.
 
     ``model.train()`` is called at every batch, which recursively switches the
     frozen Florence language/vision modules and the action-transformer base
     blocks back to training mode.  Their LoRA adapters are trainable and must
-    retain their configured dropout, while connectors and heads must remain in
-    training mode.  Set only the frozen submodules to eval and then restore
-    every PEFT LoRA-dropout module to train.
+    retain their configured dropout.  In the frozen-connector variant the
+    vision-language projection modules also stay in eval mode.  Restore every
+    PEFT LoRA-dropout module to train after switching frozen modules to eval.
     """
     if policy != _FAIR_POLICY:
         return
@@ -635,6 +657,12 @@ def _keep_frozen_vision_eval(model, policy: str):
     if vision_tower is None:
         raise RuntimeError("Fair Seen-10 model has no vision tower to freeze")
     vision_tower.eval()
+    if train_cfg is not None and train_cfg.get("freeze_vision_language_connector", False):
+        vlm = root.vlm
+        for name in ("image_projection", "image_proj_norm"):
+            connector = getattr(vlm, name, None)
+            if isinstance(connector, torch.nn.Module):
+                connector.eval()
     language_model = getattr(getattr(root, "vlm", None), "language_model", None)
     if language_model is not None:
         language_model.eval()
@@ -748,7 +776,7 @@ def _build_seen10_optimizer(model, train_cfg: dict, policy: str):
             lr_coef_soft=train_cfg["learning_coef"],
         )
 
-    grouped = {role: [] for role in sorted(_FAIR_TRAINABLE_ROLES)}
+    grouped = {role: [] for role in sorted(_fair_trainable_roles(train_cfg))}
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
@@ -945,12 +973,17 @@ def _merged_inference_state(model) -> dict[str, torch.Tensor]:
         b_key = f"base_model.model.{prefix}.lora_B.{adapter}.weight"
         if a_key not in state or b_key not in state:
             continue
-        update = state[b_key].detach().float() @ state[a_key].detach().float()
+        # The exported base tensor is already on CPU.  PEFT's adapter tensors
+        # may still live on the training GPU, so move the two low-rank factors
+        # to the base device before multiplying and adding the update.
+        base = merged[target_key]
+        lora_b = state[b_key].detach().to(device=base.device, dtype=torch.float32)
+        lora_a = state[a_key].detach().to(device=base.device, dtype=torch.float32)
+        update = lora_b @ lora_a
         module = _module_from_path(base_model, prefix)
         scaling = getattr(module, "scaling", {}).get(adapter, scaling_default) if module is not None else scaling_default
         if scaling is None:
             scaling = scaling_default or 1.0
-        base = merged[target_key]
         merged[target_key] = (base.float() + update * float(scaling)).to(dtype=base.dtype).contiguous()
     return merged
 
@@ -1144,6 +1177,7 @@ def _runtime_metadata(*, config: dict, args, data_root: Path, pretrained: str, b
     runtime = {
         "schema": "xvla_seen10_runtime_v2",
         "policy": policy,
+        "freeze_vision_language_connector": bool(train_cfg.get("freeze_vision_language_connector", False)),
         "config": str(Path(args.config).expanduser().resolve()),
         "config_sha256": hashlib.sha256(
             json.dumps(config, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -1627,8 +1661,13 @@ def _set_best_checkpoint(accelerator: Accelerator, output_root: Path, checkpoint
     _set_checkpoint_pointer(accelerator, output_root, checkpoint, progress, "best")
 
 
-def _set_last_checkpoint(accelerator: Accelerator, output_root: Path, checkpoint: Path, progress: dict):
+def _set_last_checkpoint(
+    accelerator: Accelerator, output_root: Path, checkpoint: Path, progress: dict,
+    *, late_alias: bool = False,
+):
     _set_checkpoint_pointer(accelerator, output_root, checkpoint, progress, "last")
+    if late_alias:
+        _set_checkpoint_pointer(accelerator, output_root, checkpoint, progress, "late")
 
 
 _STEP_CHECKPOINT_PATTERN = re.compile(r"^step_(\d{8})(?:_resume_(\d+))?$")
@@ -1675,6 +1714,14 @@ def _prune_periodic_checkpoints(accelerator: Accelerator, output_root: Path, max
     accelerator.wait_for_everyone()
 
 
+def _validate_resume_connector_freeze(progress: dict, frozen: bool):
+    checkpoint_frozen = bool(
+        (progress.get("runtime") or {}).get("freeze_vision_language_connector", False)
+    )
+    if checkpoint_frozen != frozen:
+        raise ValueError("Resume checkpoint vision-language connector freeze policy does not match this run")
+
+
 def _validate_resume(
     progress: dict,
     *,
@@ -1687,6 +1734,7 @@ def _validate_resume(
     action_contract: dict | None = None,
     batching: dict | None = None,
     data_contract: dict | None = None,
+    freeze_vision_language_connector: bool | None = None,
 ):
     checks = {
         "seed": args.seed,
@@ -1703,6 +1751,8 @@ def _validate_resume(
                   for key, value in checks.items() if progress.get(key) != value]
     if mismatches:
         raise ValueError("Resume checkpoint does not match this run: " + "; ".join(mismatches))
+    if freeze_vision_language_connector is not None:
+        _validate_resume_connector_freeze(progress, freeze_vision_language_connector)
     checkpoint_contract = _canonical_resume_action_contract(progress.get("action_contract"))
     requested_contract = _canonical_resume_action_contract(action_contract)
     if requested_contract is not None and checkpoint_contract != requested_contract:
@@ -1782,8 +1832,8 @@ def main():
         }
         expected_fixed = {
             "iters": 19500,
-            "eval_interval": 3900,
-            "save_interval": 3900,
+            "eval_interval": 4000 if train_cfg.get("freeze_vision_language_connector", False) else 3900,
+            "save_interval": 4000 if train_cfg.get("freeze_vision_language_connector", False) else 3900,
             "mixed_precision": "bf16",
         }
         mismatches = [
@@ -1884,6 +1934,10 @@ def main():
     if resume is not None:
         with (resume / "progress.json").open(encoding="utf-8") as stream:
             resume_progress = json.load(stream)
+        if policy == _FAIR_POLICY:
+            _validate_resume_connector_freeze(
+                resume_progress, bool(train_cfg.get("freeze_vision_language_connector", False))
+            )
     processor_source = str(resume) if resume is not None else pretrained
     processor = load_seen10_processor(processor_source)
     processor_image_size = processor_size(processor)
@@ -2082,6 +2136,10 @@ def main():
                 if policy == _FAIR_POLICY or "data_contract" in resume_progress
                 else None
             ),
+            freeze_vision_language_connector=(
+                bool(train_cfg.get("freeze_vision_language_connector", False))
+                if policy == _FAIR_POLICY else None
+            ),
         )
         global_step = int(resume_progress["global_step"])
         phase = _phase_metadata(train_cfg, global_step, policy)
@@ -2149,7 +2207,7 @@ def main():
             skip_batches = 0
             epoch_had_batch = True
             model.train()
-            _keep_frozen_vision_eval(accelerator.unwrap_model(model), policy)
+            _keep_frozen_vision_eval(accelerator.unwrap_model(model), policy, train_cfg)
             inputs = _move_inputs(batch, accelerator.device, training=True)
             if micro_batches_in_update == 0:
                 phase = _phase_metadata(train_cfg, global_step, policy)
@@ -2292,7 +2350,10 @@ def main():
                 )
                 if accelerator.is_main_process:
                     _write_json_atomic(output_root / "runtime.json", runtime_snapshot)
-                _set_last_checkpoint(accelerator, output_root, checkpoint, progress)
+                _set_last_checkpoint(
+                    accelerator, output_root, checkpoint, progress,
+                    late_alias=bool(train_cfg.get("freeze_vision_language_connector", False)),
+                )
                 if is_best:
                     _set_best_checkpoint(accelerator, output_root, checkpoint, progress)
                 _prune_periodic_checkpoints(accelerator, output_root, max_periodic_checkpoints)

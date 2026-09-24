@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from argparse import Namespace
 from copy import deepcopy
 from pathlib import Path
 
@@ -10,10 +11,13 @@ from csgo_seen10.dataset import resolve_seen10_augmentation
 from train_seen10 import (
     _FAIR_POLICY,
     _LEGACY_POLICY,
+    _build_seen10_optimizer,
     _checkpoint_data_cursor,
     _canonical_resume_action_contract,
+    _configure_trainable_parameters,
     _fair_train_loader_seed,
     _keep_frozen_vision_eval,
+    _maybe_attach_lora,
     _merged_inference_state,
     _parameter_role,
     _prune_periodic_checkpoints,
@@ -21,9 +25,13 @@ from train_seen10 import (
     _resolve_train_loader_budget,
     _restore_full_resume_state,
     _save_full_resume_state,
+    _save_state_dict,
+    _set_best_checkpoint,
+    _set_last_checkpoint,
     _phase_metadata,
     _update_seen10_lrs,
     _validate_config,
+    _validate_resume,
 )
 
 
@@ -40,6 +48,133 @@ class Seen10TrainingContractTest(unittest.TestCase):
         self.assertFalse(contract["dummy_channels_in_loss"])
         self.assertEqual(self.config["training"]["iters"], 19_500)
         self.assertEqual(self.config["training"]["eval_interval"], 3_900)
+
+    def test_frozen_vl_experiment_has_separate_contract_and_output(self):
+        frozen = json.loads(Path("configs/csgo_seen10_xvla_fair_frozen_vl.json").read_text(encoding="utf-8"))
+        self.assertEqual(_validate_config(frozen), _validate_config(self.config))
+        self.assertFalse(self.config["training"].get("freeze_vision_language_connector", False))
+        self.assertTrue(frozen["training"]["freeze_vision_language_connector"])
+        self.assertEqual(frozen["training"]["eval_interval"], 4000)
+        self.assertEqual(frozen["training"]["save_interval"], 4000)
+        self.assertNotEqual(frozen["training"]["output_root"], self.config["training"]["output_root"])
+        self.assertNotEqual(frozen["training"]["smoke_output_root"], self.config["training"]["smoke_output_root"])
+        self.assertNotIn("vlm.image_proj_norm", frozen["training"]["lora"]["modules_to_save"])
+        self.assertEqual(frozen["training"]["lora"]["extra_trainable_parameters"], [])
+        self.assertNotIn("vision_language_connector", frozen["training"]["trainable_phases"]["requires_grad"])
+        invalid = deepcopy(frozen)
+        invalid["training"]["lora"]["modules_to_save"].append("vlm.image_proj_norm")
+        with self.assertRaisesRegex(ValueError, "LoRA config"):
+            _validate_config(invalid)
+
+    def test_frozen_vl_is_absent_from_gradients_optimizer_and_late_phase(self):
+        class TinyLoRA(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lora_A = torch.nn.Parameter(torch.ones(2, 2))
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.vlm = torch.nn.Module()
+                self.vlm.vision_tower = torch.nn.Linear(2, 2)
+                self.vlm.image_projection = torch.nn.Parameter(torch.ones(2, 2))
+                self.vlm.image_proj_norm = torch.nn.LayerNorm(2)
+                self.vlm.language_model = torch.nn.Module()
+                self.vlm.language_model.model = torch.nn.Module()
+                self.vlm.language_model.model.encoder = torch.nn.Module()
+                self.vlm.language_model.model.encoder.layers = torch.nn.ModuleList([torch.nn.Module()])
+                self.vlm.language_model.model.encoder.layers[0].self_attn = torch.nn.Module()
+                self.vlm.language_model.model.encoder.layers[0].self_attn.q_proj = TinyLoRA()
+                self.transformer = torch.nn.Module()
+                self.transformer.blocks = torch.nn.ModuleList([torch.nn.Module()])
+                self.transformer.blocks[0].attn = torch.nn.Module()
+                self.transformer.blocks[0].attn.qkv = TinyLoRA()
+                self.transformer.soft_prompt_hub = torch.nn.Linear(2, 2)
+                self.transformer.action_encoder = torch.nn.Linear(2, 2)
+                self.transformer.vlm_proj = torch.nn.Linear(2, 2)
+
+        frozen = json.loads(Path("configs/csgo_seen10_xvla_fair_frozen_vl.json").read_text(encoding="utf-8"))
+        train_cfg = frozen["training"]
+        model = TinyModel()
+        audit = _configure_trainable_parameters(model, train_cfg, _FAIR_POLICY)
+        self.assertEqual(audit["by_role"]["vision_language_connector"]["trainable"], 0)
+        self.assertTrue(all(not parameter.requires_grad for parameter in model.vlm.image_proj_norm.parameters()))
+        self.assertFalse(model.vlm.image_projection.requires_grad)
+        optimizer = _build_seen10_optimizer(model, train_cfg, _FAIR_POLICY)
+        self.assertNotIn("vision_language_connector", {group["name"] for group in optimizer.param_groups})
+        self.assertNotIn("vision_language_connector", _phase_metadata(train_cfg, 1000, _FAIR_POLICY)["active_lr_roles"])
+        _update_seen10_lrs(optimizer, 999, train_cfg, _FAIR_POLICY, None)
+        self.assertEqual({group["name"] for group in optimizer.param_groups if group["lr"] == 1e-4}, {"soft_prompt", "action_heads"})
+        _update_seen10_lrs(optimizer, 1000, train_cfg, _FAIR_POLICY, None)
+        self.assertEqual({group["lr"] for group in optimizer.param_groups}, {1e-4})
+        self.assertNotIn("vision_language_connector", {group["name"] for group in optimizer.param_groups})
+        old = TinyModel()
+        old_audit = _configure_trainable_parameters(old, self.config["training"], _FAIR_POLICY)
+        self.assertGreater(old_audit["by_role"]["vision_language_connector"]["trainable"], 0)
+        self.assertIn("vision_language_connector", {group["name"] for group in _build_seen10_optimizer(old, self.config["training"], _FAIR_POLICY).param_groups})
+
+    def test_frozen_vl_peft_does_not_wrap_image_proj_norm(self):
+        try:
+            import peft  # noqa: F401
+        except ImportError:
+            self.skipTest("peft is unavailable")
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.vlm = torch.nn.Module()
+                self.vlm.image_projection = torch.nn.Parameter(torch.ones(2, 2))
+                self.vlm.image_proj_norm = torch.nn.LayerNorm(2)
+                self.vlm.language_model = torch.nn.Module()
+                self.vlm.language_model.model = torch.nn.Module()
+                self.vlm.language_model.model.encoder = torch.nn.Module()
+                self.vlm.language_model.model.encoder.layers = torch.nn.ModuleList([torch.nn.Module()])
+                self.vlm.language_model.model.encoder.layers[0].self_attn = torch.nn.Module()
+                self.vlm.language_model.model.encoder.layers[0].self_attn.q_proj = torch.nn.Linear(2, 2)
+                self.transformer = torch.nn.Module()
+                self.transformer.blocks = torch.nn.ModuleList([torch.nn.Module()])
+                self.transformer.blocks[0].attn = torch.nn.Module()
+                self.transformer.blocks[0].attn.qkv = torch.nn.Linear(2, 2)
+                self.transformer.vlm_proj = torch.nn.Linear(2, 2)
+                self.transformer.soft_prompt_hub = torch.nn.Linear(2, 2)
+                self.transformer.action_encoder = torch.nn.Linear(2, 2)
+
+        frozen = json.loads(Path("configs/csgo_seen10_xvla_fair_frozen_vl.json").read_text(encoding="utf-8"))
+        model, attached = _maybe_attach_lora(TinyModel(), frozen["training"])
+        self.assertTrue(attached)
+        self.assertFalse(hasattr(model.base_model.model.vlm.image_proj_norm, "modules_to_save"))
+        self.assertTrue(hasattr(model.base_model.model.transformer.vlm_proj, "modules_to_save"))
+        audit = _configure_trainable_parameters(model, frozen["training"], _FAIR_POLICY)
+        self.assertEqual(audit["by_role"]["vision_language_connector"]["trainable"], 0)
+
+    def test_resume_rejects_switching_vision_language_connector_policy(self):
+        class Dataset:
+            limit_per_map = None
+
+            def __len__(self):
+                return 10
+
+        progress = {
+            "seed": 0,
+            "smoke": False,
+            "data_root": "/data",
+            "train_samples": 10,
+            "validation_samples": 10,
+            "train_limit_per_map": None,
+            "validation_limit_per_map": None,
+            "batch_size": 4,
+            "world_size": 1,
+            "runtime": {"freeze_vision_language_connector": True},
+        }
+        kwargs = dict(
+            args=Namespace(seed=0, smoke=False), data_root=Path("/data"),
+            train_dataset=Dataset(), validation_dataset=Dataset(), batch_size=4, world_size=1,
+        )
+        _validate_resume(progress, freeze_vision_language_connector=True, **kwargs)
+        with self.assertRaisesRegex(ValueError, "freeze policy"):
+            _validate_resume(progress, freeze_vision_language_connector=False, **kwargs)
+        del progress["runtime"]  # Existing fair checkpoints predate the explicit flag.
+        _validate_resume(progress, freeze_vision_language_connector=False, **kwargs)
 
     def test_augmentation_is_explicit_and_train_only(self):
         self.assertFalse(resolve_seen10_augmentation("seen_train"))
@@ -167,6 +302,32 @@ class Seen10TrainingContractTest(unittest.TestCase):
         )
         self.assertEqual(_parameter_role("base_model.model.vlm.image_projection"), "vision_language_connector")
 
+    def test_frozen_vl_best_late_last_are_links_to_five_step_directories(self):
+        class Accelerator:
+            is_main_process = True
+
+            def wait_for_everyone(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoints = root / "checkpoints"
+            checkpoints.mkdir()
+            for step in (4000, 8000, 12000, 16000, 19500):
+                checkpoint = checkpoints / f"step_{step:08d}"
+                checkpoint.mkdir()
+                progress = {"checkpoint_id": str(step), "global_step": step, "seed": 0}
+                _set_last_checkpoint(Accelerator(), root, checkpoint, progress, late_alias=True)
+                if step in (4000, 8000):
+                    _set_best_checkpoint(Accelerator(), root, checkpoint, progress)
+                _prune_periodic_checkpoints(Accelerator(), root, 5)
+            for name, step in (("best", 8000), ("late", 19500), ("last", 19500)):
+                link = checkpoints / name
+                self.assertTrue(link.is_symlink())
+                self.assertEqual(link.resolve().name, f"step_{step:08d}")
+                self.assertEqual(json.loads((checkpoints / f"{name}.json").read_text())["global_step"], step)
+            self.assertEqual(len([p for p in checkpoints.iterdir() if p.is_dir() and not p.is_symlink()]), 5)
+
     def test_pruning_caps_physical_checkpoints_while_preserving_best_and_last(self):
         class Accelerator:
             is_main_process = True
@@ -248,6 +409,33 @@ class Seen10TrainingContractTest(unittest.TestCase):
         actual = dict(model.named_parameters())
         for name, expected in expected_trainable.items():
             self.assertTrue(torch.equal(actual[name], expected), name)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_gpu_lora_merges_into_cpu_inference_checkpoint(self):
+        try:
+            from peft import LoraConfig, get_peft_model
+            from safetensors.torch import load_file
+        except ImportError:
+            self.skipTest("peft or safetensors is unavailable")
+
+        model = get_peft_model(
+            torch.nn.Sequential(torch.nn.Linear(3, 2, bias=True)).cuda(),
+            LoraConfig(r=2, lora_alpha=4, target_modules=["0"]),
+        )
+        with torch.no_grad():
+            model.base_model.model[0].lora_A.default.weight.fill_(0.25)
+            model.base_model.model[0].lora_B.default.weight.fill_(0.5)
+        reference = deepcopy(model).merge_and_unload().state_dict()
+        merged = _merged_inference_state(model)
+        self.assertEqual(set(merged), set(reference))
+        self.assertTrue(all(value.device.type == "cpu" for value in merged.values()))
+        for name, expected in reference.items():
+            torch.testing.assert_close(merged[name], expected.cpu(), rtol=1e-5, atol=1e-6)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "model.safetensors"
+            _save_state_dict(path, merged)
+            loaded = load_file(str(path), device="cpu")
+            self.assertEqual(set(loaded), set(reference))
 
 
 if __name__ == "__main__":
