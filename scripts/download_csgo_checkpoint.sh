@@ -5,8 +5,16 @@ PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 MODEL_DIR="${PROJECT_ROOT}/pretrained/X-VLA-Pt"
 PYTHON_BIN="${CSGO_PYTHON:-${PROJECT_ROOT}/.venv/bin/python}"
 
-if [[ ! -x "${PYTHON_BIN}" ]]; then
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1 || ! "${PYTHON_BIN}" -c 'import sys' >/dev/null 2>&1; then
   echo "Python not found at ${PYTHON_BIN}; run scripts/setup_csgo_seen10.sh first." >&2
+  exit 1
+fi
+if ! "${PYTHON_BIN}" -c 'import huggingface_hub' >/dev/null 2>&1; then
+  echo "huggingface_hub is missing in ${PYTHON_BIN}; complete scripts/setup_csgo_seen10.sh first." >&2
+  exit 1
+fi
+if ! command -v curl >/dev/null 2>&1; then
+  echo "curl is required to download the checkpoint; install curl and rerun this script." >&2
   exit 1
 fi
 

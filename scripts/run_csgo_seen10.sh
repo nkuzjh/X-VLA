@@ -4,9 +4,17 @@ set -euo pipefail
 PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 PYTHON="${CSGO_PYTHON:-$PROJECT_ROOT/.venv/bin/python}"
-DATA_ROOT="${DATA_ROOT:-/home/jiahao/task/UniLIP/data/csgo_benchmark_v2}"
-UNILIP_PYTHON="${UNILIP_PYTHON:-/home/jiahao/miniconda3/envs/UniLIP/bin/python}"
-SHARED_EVAL_DIR="${SHARED_EVAL_DIR:-$PROJECT_ROOT/../csgo_benchmark_v2_eval_general}"
+DATA_ROOT="${DATA_ROOT:-${CSGO_DATA_ROOT:-}}"
+# Localization needs only the model environment (torch and PyYAML), not a
+# separate UniLIP installation. Keep the old override for existing deployments.
+UNILIP_PYTHON="${UNILIP_PYTHON:-$PYTHON}"
+if [[ -z "${SHARED_EVAL_DIR:-}" ]]; then
+    if [[ -f "$PROJECT_ROOT/../csgo_benchmark_v2_eval_general/run_eval.py" ]]; then
+        SHARED_EVAL_DIR="$PROJECT_ROOT/../csgo_benchmark_v2_eval_general"
+    else
+        SHARED_EVAL_DIR="$PROJECT_ROOT/csgo_benchmark_v2_eval"
+    fi
+fi
 EVALUATOR="$SHARED_EVAL_DIR/run_eval.py"
 CONFIG="$PROJECT_ROOT/configs/csgo_seen10.json"
 PRETRAINED="$PROJECT_ROOT/pretrained/X-VLA-Pt"
@@ -69,7 +77,7 @@ check_evaluator() {
         return 1
     fi
     if [[ ! -x "$UNILIP_PYTHON" ]]; then
-        echo "UniLIP evaluator Python is missing: $UNILIP_PYTHON" >&2
+        echo "Evaluator Python is missing: $UNILIP_PYTHON. Run scripts/setup_csgo_seen10.sh first." >&2
         return 1
     fi
 }
@@ -82,7 +90,9 @@ case "$COMMAND" in
         ;;
 esac
 
-mapfile -t CONFIG_OUTPUT_ROOTS < <(python3 - "$CONFIG" "$PROJECT_ROOT" <<'PY'
+CONFIG_PYTHON="$PYTHON"
+if [[ "$COMMAND" == eval ]]; then CONFIG_PYTHON="$UNILIP_PYTHON"; fi
+CONFIG_PATHS="$("$CONFIG_PYTHON" - "$CONFIG" "$PROJECT_ROOT" "$DATA_ROOT" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -94,8 +104,14 @@ for key in ("output_root", "smoke_output_root"):
     if not value.is_absolute():
         value = project_root / value
     print(value.resolve())
+data_root = Path(sys.argv[3] or config["data"]["root"]).expanduser()
+if not data_root.is_absolute():
+    data_root = project_root / data_root
+print(data_root.resolve())
 PY
-)
+)"
+mapfile -t CONFIG_OUTPUT_ROOTS <<< "$CONFIG_PATHS"
+DATA_ROOT="${CONFIG_OUTPUT_ROOTS[2]}"
 FORMAL_ROOT="${CONFIG_OUTPUT_ROOTS[0]}/seed_$SEED"
 SMOKE_ROOT="${CONFIG_OUTPUT_ROOTS[1]}/seed_$SEED"
 if [[ -z "$OUTPUT_ROOT" ]]; then

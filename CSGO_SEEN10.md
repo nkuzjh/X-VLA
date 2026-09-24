@@ -1,6 +1,6 @@
 # X-VLA 接入 CSGO Benchmark v2 Seen-10
 
-本文是 X-VLA 接入 CSGO Benchmark v2 的运行说明。当前只覆盖 Seen-10 定位任务，不包含生成任务，也不包含 CrossMap-4。命令均从项目根目录 `/home/jiahao/task/X-VLA` 执行。
+本文是 X-VLA 接入 CSGO Benchmark v2 的运行说明。当前只覆盖 Seen-10 定位任务，不包含生成任务，也不包含 CrossMap-4。命令均从本机的 X-VLA 项目根目录执行，例如 `~/task/X-VLA`；不依赖具体用户名。
 
 ## 1. 背景、目标和实验范围
 
@@ -18,7 +18,7 @@ CSGO Benchmark v2 用第一视角图像（FPV）、对应地图 radar 和定位�
 
 ## 2. 数据、地图和输入输出边界
 
-数据根目录为 `/home/jiahao/task/UniLIP/data/csgo_benchmark_v2`，官方评测器目录为 `/home/jiahao/task/csgo_benchmark_v2_eval_general`。数据和样本顺序由官方 manifest 决定，不重新划分数据、不从测试集计算统计量。
+默认数据目录为项目相邻的 `../UniLIP/data/csgo_benchmark_v2`。启动脚本优先使用相邻的 `../csgo_benchmark_v2_eval_general` 官方评测器；该目录不存在时使用仓库自带的 `csgo_benchmark_v2_eval`。定位评测默认使用项目 `.venv`，无需另外创建 UniLIP 环境。数据和样本顺序由官方 manifest 决定，不重新划分数据、不从测试集计算统计量。
 
 Seen-10 使用以下 10 张地图：`cs_agency`、`cs_italy`、`de_ancient`、`de_anubis`、`de_dust2`、`de_inferno`、`de_mirage`、`de_nuke`、`de_overpass`、`de_train`。
 
@@ -117,13 +117,27 @@ aligned 的有效定位 batch 为 128 个样本，使用梯度累计适配可见
 
 ## 5. 环境和权重准备
 
-以下准备命令对三套实验共用，只需准备一次。数据和官方评测器应当已经位于本文第 2 节所列路径。
+以下准备命令对三套实验共用，每台服务器分别准备一次。Git 同步项目代码后，在新服务器重新创建环境并下载权重；不要跨服务器复制 `.venv`。最小数据集需要另行放置到第 2 节所列目录，包含 JSON、images、radars 和发布标定。数据、权重和训练产物不随 Git 同步。
 
 ```bash
-cd /home/jiahao/task/X-VLA
+cd ~/task/X-VLA
 bash scripts/setup_csgo_seen10.sh
 bash scripts/download_csgo_checkpoint.sh
 ```
+
+准备脚本优先复用项目中兼容的隔离 `.venv`；新建环境时自动寻找 Python 3.12、3.11 或 3.10。当前 Conda 环境的 Python 也可以作为候选，不要求系统提供名为 `python3.12` 的命令。如果没有兼容解释器但可以使用 Conda，脚本会在项目 `.cache` 下准备 Python 3.12，再创建 `.venv`，无需 sudo，也不修改 Conda base。已有但损坏或版本不兼容的 `.venv` 会给出诊断，不自动删除。
+
+如需显式选择解释器，可将环境准备命令替换为一行：
+
+```bash
+PYTHON_BIN=/path/to/python3.11 bash scripts/setup_csgo_seen10.sh
+```
+
+依赖继续使用固定的 PyTorch 2.7.1 / torchvision 0.22.1 CUDA 12.8 组合；Python 版本自动选择不会改变实验配置或 PyTorch 版本。服务器仍需提供兼容的 NVIDIA 驱动。脚本只复用与当前 Python 和平台兼容的本地 wheel，其余依赖按固定版本安装。
+
+权重下载脚本依赖环境准备先成功完成，并需要 `curl`。如果第一条准备命令失败，应先处理该错误，再运行权重下载。
+
+默认目录布局下，第 6 节的命令在两台服务器上完全相同。若数据放在其他位置，在训练、推理和评测命令后都追加相同的 `--data-root /path/to/csgo_benchmark_v2`。外部评测器或 Python 有特殊安排时，可在单条评测命令前指定 `SHARED_EVAL_DIR` 或 `UNILIP_PYTHON`；默认使用项目环境，无需这些变量。
 
 权重下载完成后，原始权重位于 `pretrained/X-VLA-Pt`。三套实验都必须从该原始 X-VLA 权重开始，不能用已经见过 CSGO Benchmark v2 的 checkpoint 继续初始化。
 

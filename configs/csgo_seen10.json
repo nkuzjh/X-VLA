@@ -1,6 +1,6 @@
 {
   "data": {
-    "root": "/home/jiahao/task/UniLIP/data/csgo_benchmark_v2",
+    "root": "../UniLIP/data/csgo_benchmark_v2",
     "train_split": "seen_train",
     "validation_split": "seen_validation",
     "test_split": "seen_discrete_test",
