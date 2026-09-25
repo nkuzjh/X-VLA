@@ -199,6 +199,10 @@ bash scripts/run_csgo_seen10.sh eval --config configs/csgo_seen10_xvla_fair_froz
 
 单 GPU 使用 Accelerate 时删除 `--multi_gpu` 并将 `--num_processes` 改为 1，按显存调整 batch。默认与加速推理二选一，完成后使用上面的同一条 eval 命令。新实验输出目录与 legacy、原 aligned 均独立。
 
+```bash
+./.venv/bin/accelerate launch --num_processes 1 infer_seen10.py --config configs/csgo_seen10_xvla_fair_frozen_vl.json --seed 0 --batch-size 16 --num-workers 4
+```
+
 ### 6.4 推理与评测口径
 
 当前推理噪声按 batch 设置随机种子，因此改变 batch size 或进程数可能改变具体预测。正式结果必须预先选定一种推理命令，并对所有对比实验保持一致；不能在看到测试结果后切换推理方式。
